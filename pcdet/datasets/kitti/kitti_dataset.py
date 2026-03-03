@@ -63,7 +63,25 @@ class KittiDataset(DatasetTemplate):
     def get_lidar(self, idx):
         lidar_file = self.root_split_path / 'velodyne' / ('%s.bin' % idx)
         assert lidar_file.exists()
-        return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 4)
+        #return np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, 4)
+        number_of_channels = 7  # ['x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time']
+        points = np.fromfile(str(lidar_file), dtype=np.float32).reshape(-1, number_of_channels)
+
+        # replace the list values with statistical values; for x, y, z and time, use 0 and 1 as means and std to avoid normalization
+        means = [0, 0, 0, 0, 0, 0, 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        stds =  [1, 1, 1, 1, 1, 1, 1]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+
+        #in practice, you should use either train, or train+val values to calculate mean and stds. Note that x, y, z, and time are not normed, but you can experiment with that.
+        #means = [0, 0, 0, mean_RCS (~ -13.0), mean_v_r (~-3.0), mean_vr_comp (~ -0.1), 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+        #stds =  [1, 1, 1, std_RCS (~14.0),  std_v_r (~8.0),    std_v_r_comp (~6.0), 0]  # 'x', 'y', 'z', 'rcs', 'v_r', 'v_r_comp', 'time'
+
+
+        #we then norm the channels
+        points = (points - means)/stds
+
+        return points
+
+
 
     def get_image(self, idx):
         """
@@ -73,7 +91,7 @@ class KittiDataset(DatasetTemplate):
         Returns:
             image: (H, W, 3), RGB Image
         """
-        img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
+        img_file = self.root_split_path / 'image_2' / ('%s.jpg' % idx)
         assert img_file.exists()
         image = io.imread(img_file)
         image = image.astype(np.float32)
@@ -81,7 +99,11 @@ class KittiDataset(DatasetTemplate):
         return image
 
     def get_image_shape(self, idx):
-        img_file = self.root_split_path / 'image_2' / ('%s.png' % idx)
+        img_file = self.root_split_path / 'image_2' / ('%s.jpg' % idx)
+       
+        # ADD THIS PRINT STATEMENT:
+        print(f"\n[DEBUG] Looking for image at: {img_file}")
+        
         assert img_file.exists()
         return np.array(io.imread(img_file).shape[:2], dtype=np.int32)
 
@@ -98,7 +120,7 @@ class KittiDataset(DatasetTemplate):
         Returns:
             depth: (H, W), Depth map
         """
-        depth_file = self.root_split_path / 'depth_2' / ('%s.png' % idx)
+        depth_file = self.root_split_path / 'depth_2' / ('%s.jpg' % idx)
         assert depth_file.exists()
         depth = io.imread(depth_file)
         depth = depth.astype(np.float32)

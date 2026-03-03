@@ -7,6 +7,23 @@ import glob
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
 
+class EarlyStopper:
+    def __init__(self, patience=10, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float('inf')
+
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
+
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
                     rank, tbar, total_it_each_epoch, dataloader_iter, tb_log=None, leave_pbar=False, 
@@ -146,8 +163,37 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         pbar.close()
     return accumulated_iter
 
+def validate_one_epoch(model, model_func, test_loader, validation_loss, logger=None):
+    model.train()
+    
+    #Avoid data leakege during validation by setting BatchNorm layers to eval mode
+    for m in model.modules():
+        if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+            m.eval()
 
-def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_cfg,
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        # Loop through the entire validation dataloader
+        for batch in test_loader:
+            loss, _, _ = model_func(model, batch)
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+    avg_loss = total_loss / max(num_batches, 1)
+    validation_loss.append(avg_loss)
+    
+    if logger is not None:
+        logger.info(f'Validation Loss for Epoch: {avg_loss:.4f}')
+    else:
+        print(f'Validation Loss for Epoch: {avg_loss:.4f}')
+        
+    model.train()
+
+
+def train_model(model, optimizer, train_loader, test_loader, model_func, lr_scheduler, optim_cfg,
                 start_epoch, total_epochs, start_iter, rank, tb_log, ckpt_save_dir, train_sampler=None,
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False, use_amp=False,
@@ -158,6 +204,8 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
     hook_config = cfg.get('HOOK', None) 
     augment_disable_flag = False
 
+    earlyStopper = EarlyStopper()
+    validation_loss = []
     with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)
         if merge_all_iters_to_one_epoch:
@@ -193,6 +241,20 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 show_gpu_stat=show_gpu_stat,
                 use_amp=use_amp
             )
+
+            # Eval for early stopping
+            validate_one_epoch(model, model_func, test_loader, validation_loss)
+            if earlyStopper.early_stop(validation_loss[-1]):
+                if logger is not None:
+                    logger.info(f"Early stopping at epoch {cur_epoch} with validation loss {validation_loss}")
+                else:
+                    print(f"Early stopping at epoch {cur_epoch} with validation loss {validation_loss}")
+                break
+            else:
+                if logger is not None:
+                    logger.info(f"No early stopping at epoch {cur_epoch} with validation loss {validation_loss}. Early stopping counter: {earlyStopper.counter}")
+                else:
+                    print(f"No early stopping at epoch {cur_epoch} with validation loss {validation_loss}. Early stopping counter: {earlyStopper.counter}")
 
             # save trained model
             trained_epoch = cur_epoch + 1
