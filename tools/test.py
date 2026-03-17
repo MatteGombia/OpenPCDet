@@ -127,12 +127,35 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
 
         if cfg.LOCAL_RANK == 0:
             for key, val in tb_dict.items():
-                tb_log.add_scalar(key, val, cur_epoch_id)
+                # THE FIX: Only send standard numbers to TensorBoard
+                if isinstance(val, (int, float)):
+                    tb_log.add_scalar(key, val, cur_epoch_id)
+                else:
+                    log_to_tb(tb_log, key, val, cur_epoch_id)
 
         # record this epoch which has been evaluated
         with open(ckpt_record_file, 'a') as f:
             print('%s' % cur_epoch_id, file=f)
         logger.info('Epoch %s has been evaluated' % cur_epoch_id)
+
+# THE FIX: A recursive helper to unpack nested dictionaries for TensorBoard
+def log_to_tb(tb_writer, prefix, value, epoch):
+    import numpy as np
+    import torch
+    
+    # If it's a number, log it!
+    if isinstance(value, (int, float, np.number)):
+        tb_writer.add_scalar(prefix, float(value), epoch)
+    # If it's a PyTorch tensor (sometimes recalls are stored this way), extract the number
+    elif isinstance(value, torch.Tensor) and value.numel() == 1:
+        tb_writer.add_scalar(prefix, value.item(), epoch)
+    # If it's a nested dictionary, dive inside and append the key name!
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            log_to_tb(tb_writer, f"{prefix}/{k}", v, epoch)
+    # Ignore strings, lists, or other complex objects
+    else:
+        pass
 
 
 def main():

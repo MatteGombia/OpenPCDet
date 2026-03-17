@@ -10,6 +10,7 @@ from ...utils import common_utils
 from ..dataset import DatasetTemplate
 from pyquaternion import Quaternion
 from PIL import Image
+from nuscenes.utils.data_classes import RadarPointCloud
 
 
 class NuScenesDataset(DatasetTemplate):
@@ -101,20 +102,45 @@ class NuScenesDataset(DatasetTemplate):
     def get_lidar_with_sweeps(self, index, max_sweeps=1):
         info = self.infos[index]
         lidar_path = self.root_path / info['lidar_path']
-        points = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
+
+        # --- FIX 1: Use RadarPointCloud to read the .pcd file ---
+        pc = RadarPointCloud.from_file(str(lidar_path))
+        points_raw = pc.points.T  # Shape becomes (N, 18)
+        
+        # Extract [x, y, z, rcs, vx_comp, vy_comp]
+        # nuScenes radar indices: 0=x, 1=y, 2=z, 5=rcs, 8=vx_comp, 9=vy_comp
+        points = points_raw[:, [0, 1, 2, 5, 8, 9]]
 
         sweep_points_list = [points]
         sweep_times_list = [np.zeros((points.shape[0], 1))]
 
         for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
-            points_sweep, times_sweep = self.get_sweep(info['sweeps'][k])
-            sweep_points_list.append(points_sweep)
-            sweep_times_list.append(times_sweep)
+            is_valid_sweep = True
+            if len(info['sweeps']) == 0:
+                is_valid_sweep = False
+            else:
+                sweep = info['sweeps'][k]
+                sweep_path = self.root_path / sweep['lidar_path']
+
+                sweep_pc = RadarPointCloud.from_file(str(sweep_path))
+                sweep_points_raw = sweep_pc.points.T
+                sweep_points = sweep_points_raw[:, [0, 1, 2, 5, 8, 9]]
+
+                # --- THE MAGIC FIX ---
+                # If there is no matrix (e.g., first frame of a scene), skip the transformation!
+                if sweep['transform_matrix'] is not None:
+                    sweep_points[:, :3] = sweep_points[:, :3] @ sweep['transform_matrix'][:3, :3].T
+                    sweep_points[:, :3] += sweep['transform_matrix'][:3, 3]
+
+                sweep_points_list.append(sweep_points)
+                sweep_times_list.append(sweep['time_lag'] * np.ones((sweep_points.shape[0], 1)))
 
         points = np.concatenate(sweep_points_list, axis=0)
-        times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
-
+        times = np.concatenate(sweep_times_list, axis=0)
+        
+        # Final shape: (N, 7) -> [x, y, z, rcs, vx_comp, vy_comp, time]
         points = np.concatenate((points, times), axis=1)
+        
         return points
 
     def crop_image(self, input_dict):
@@ -230,7 +256,38 @@ class NuScenesDataset(DatasetTemplate):
 
         if 'gt_boxes' in info:
             if self.dataset_cfg.get('FILTER_MIN_POINTS_IN_GT', False):
-                mask = (info['num_lidar_pts'] > self.dataset_cfg.FILTER_MIN_POINTS_IN_GT - 1)
+                import torch
+                from pcdet.ops.roiaware_pool3d import roiaware_pool3d_utils
+                
+                gt_boxes = info['gt_boxes']
+                
+                # Guard against completely empty frames
+                if len(gt_boxes) == 0:
+                    mask = np.zeros(0, dtype=bool)
+                else:
+                    # 1. Force the exact dimensions to prevent PyTorch flattening traps
+                    boxes_tensor = torch.from_numpy(gt_boxes[:, :7]).float().reshape(-1, 7)
+                    points_tensor = torch.from_numpy(points[:, :3]).float().reshape(-1, 3)
+                    
+                    # 2. Dynamically handle the Fork Argument Swap
+                    try:
+                        point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(boxes_tensor, points_tensor).numpy()
+                    except AssertionError:
+                        point_indices = roiaware_pool3d_utils.points_in_boxes_cpu(points_tensor, boxes_tensor).numpy()
+                    
+                    # 3. Tally the votes robustly based on the returned shape!
+                    if point_indices.ndim == 2:
+                        # FORK BEHAVIOR: It's a 2D mask (num_boxes, num_points) of 1s and 0s
+                        point_counts = point_indices.sum(axis=1)
+                    else:
+                        # STANDARD BEHAVIOR: It's a 1D array of box indices
+                        point_counts = np.zeros(gt_boxes.shape[0], dtype=np.int32)
+                        valid_indices = point_indices[point_indices != -1]
+                        unique_boxes, counts = np.unique(valid_indices, return_counts=True)
+                        point_counts[unique_boxes] = counts
+                    
+                    # 4. Create the mask
+                    mask = point_counts >= self.dataset_cfg.FILTER_MIN_POINTS_IN_GT
             else:
                 mask = None
 
@@ -261,8 +318,8 @@ class NuScenesDataset(DatasetTemplate):
         nusc_annos = nuscenes_utils.transform_det_annos_to_nusc_annos(det_annos, nusc)
         nusc_annos['meta'] = {
             'use_camera': False,
-            'use_lidar': True,
-            'use_radar': False,
+            'use_lidar': False,
+            'use_radar': True,
             'use_map': False,
             'use_external': False,
         }

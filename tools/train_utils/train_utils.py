@@ -8,7 +8,7 @@ from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
 
 class EarlyStopper:
-    def __init__(self, patience=10, min_delta=0):
+    def __init__(self, patience=200, min_delta=0):
         self.patience = patience
         self.min_delta = min_delta
         self.counter = 0
